@@ -57,6 +57,15 @@ pub struct RuleDef {
     pub attrs: Vec<(String, AttrType)>,
 }
 
+/// A provider TYPE declaration's codec-neutral form (`provider(name, fields=[…])`), carried as a value so it
+/// survives `load()` across `.bzl`s (a provider is first-class loadable, like a rule). Identity is `id` (the
+/// declared name); `fields` are the declared field names.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProviderDef {
+    pub id: String,
+    pub fields: Vec<String>,
+}
+
 /// A codec-neutral value a `.bzl` can export at module scope.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BzlValue {
@@ -67,6 +76,8 @@ pub enum BzlValue {
     List(Vec<BzlValue>),
     /// A rule defined by `rule(...)` — its identity + attr schema (see `RuleDef`).
     Rule(RuleDef),
+    /// A provider type defined by `provider(...)` — its identity + field schema (see `ProviderDef`).
+    Provider(ProviderDef),
 }
 
 /// The exported global bindings of an evaluated `.bzl`, sorted by name (deterministic).
@@ -100,6 +111,37 @@ pub struct TargetDecl {
     pub name: String,
     pub attrs: Vec<(String, BzlValue)>,
     pub origin: Option<RuleOrigin>,
+}
+
+// ──────────────── analysis: providers (the rule-evaluation output) ────────────────
+
+/// A provider's identity — the key for `dep[Provider]` lookup. SPIKE: the provider's declared name (a string).
+/// Two providers sharing a name would collide; a future id can add the defining `.bzl` ADDITIVELY (anti-corner:
+/// keep identity minimal + by-name now, no merge-algebra assumptions baked in — ADR-0004's later half).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct ProviderId(pub String);
+
+/// A provider INSTANCE — a typed, codec-neutral value a rule's impl publishes (`Provider(field = …)`). This is
+/// the analysis phase's per-target output; it flows along dependency edges (`dep[Provider]`). `fields` are
+/// name-sorted (deterministic → early-cutoff friendly). The rule's impl is NOT stored — only its plain result.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ProviderInstance {
+    pub provider: ProviderId,
+    pub fields: Vec<(String, BzlValue)>,
+}
+impl ProviderInstance {
+    pub fn get(&self, field: &str) -> Option<&BzlValue> {
+        self.fields.iter().find(|(n, _)| n == field).map(|(_, v)| v)
+    }
+}
+
+/// One dependency's analysis result as fed into a rule impl: the providers that dep published, keyed by its
+/// label. The analysis node resolves a target's label-typed attrs to these (restart-driven); the impl reads
+/// them via `dep[Provider]`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DepProviders {
+    pub label: String,
+    pub providers: Vec<ProviderInstance>,
 }
 
 /// Fail-closed evaluation errors — never a panic, never a silent default.
@@ -147,6 +189,27 @@ pub trait BzlEvaluator: Send + Sync {
         source: &str,
         loaded: &[(String, BzlModule)],
     ) -> Result<Vec<TargetDecl>, BzlError>;
+
+    /// Run a rule's implementation and return the providers it publishes — the analysis-phase seam. The rule
+    /// is defined in `rule_source` (the evaluator re-evaluates it to obtain the live impl + provider/ctx
+    /// machinery); `rule_name` selects which rule. `loaded` supplies the rule `.bzl`'s own `load()` deps;
+    /// `attrs` are the target's attribute values (the evaluator validates label-typed attrs against `deps`);
+    /// `deps` supplies each dependency's already-computed providers (keyed by label) for `ctx.attr.<labels>` +
+    /// `dep[Provider]`. Pure w.r.t. the engine: the caller owns the dependency graph (resolves deps to nodes,
+    /// restarts) while the evaluator is a deterministic function of these inputs.
+    ///
+    /// SPIKE: `ctx` exposes `ctx.label` + `ctx.attr.<name>` + dep providers; actions/toolchains are not on
+    /// `ctx` yet (they are fail-closed `Unsupported` when the impl reaches for them — ADR-0004/#4 territory).
+    fn evaluate_rule(
+        &self,
+        rule_source: &str,
+        rule_module_name: &str,
+        rule_name: &str,
+        loaded: &[(String, BzlModule)],
+        label: &str,
+        attrs: &[(String, BzlValue)],
+        deps: &[DepProviders],
+    ) -> Result<Vec<ProviderInstance>, BzlError>;
 }
 
 pub mod conformance {
@@ -378,6 +441,109 @@ pub mod conformance {
         assert!(
             e.evaluate("m.bzl", src, &[("rules".to_string(), rule_mod)]).is_err(),
             "calling a rule from a .bzl (no target registry) must fail closed, not panic"
+        );
+    }
+
+    // ──────────────── analysis: running a rule impl → providers (the A2 seam) ────────────────
+
+    /// The headline A2 contract: a REAL `.bzl`-defined rule impl runs through the Starlark seam, reads an
+    /// attribute AND a dependency's provider, and publishes a provider — proving providers flow along edges.
+    /// (The sum-provider exam, evaluated directly here; A4 runs the same shape through the engine, granularly.)
+    pub fn supports_rule_evaluation<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+
+def _impl(ctx):
+    t = ctx.attr.value
+    for d in ctx.attr.deps:
+        t += d[NumberInfo].total
+    return [NumberInfo(total = t)]
+
+my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"deps\": attr.label_list()})
+";
+        let attrs = vec![
+            ("value".to_string(), BzlValue::Int(2)),
+            ("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into()), BzlValue::Str(":b".into())])),
+        ];
+        let pi = |n: i64| ProviderInstance {
+            provider: ProviderId("NumberInfo".into()),
+            fields: vec![("total".to_string(), BzlValue::Int(n))],
+        };
+        let deps = vec![
+            DepProviders { label: ":a".to_string(), providers: vec![pi(10)] },
+            DepProviders { label: ":b".to_string(), providers: vec![pi(20)] },
+        ];
+        let out = e
+            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps)
+            .expect("the rule impl must run and publish a provider");
+        assert_eq!(out.len(), 1, "the impl returns exactly one provider");
+        assert_eq!(out[0].provider, ProviderId("NumberInfo".into()));
+        assert_eq!(
+            out[0].get("total"),
+            Some(&BzlValue::Int(32)),
+            "ctx.attr.value (2) + sum of deps' NumberInfo.total (10 + 20) = 32 — providers flow along edges"
+        );
+    }
+
+    /// Fail-closed: reaching for an undeclared dep provider (`dep[Missing]`) is a loud error, never empty.
+    pub fn rule_eval_missing_provider_is_fail_closed<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+OtherInfo = provider(\"OtherInfo\", fields = [\"x\"])
+
+def _impl(ctx):
+    return [NumberInfo(total = ctx.attr.deps[0][OtherInfo].x)]
+
+my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
+";
+        let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into())]))];
+        let deps = vec![DepProviders {
+            label: ":a".to_string(),
+            // the dep publishes NumberInfo, NOT OtherInfo — so dep[OtherInfo] must fail closed.
+            providers: vec![ProviderInstance {
+                provider: ProviderId("NumberInfo".into()),
+                fields: vec![("total".to_string(), BzlValue::Int(1))],
+            }],
+        }];
+        assert!(
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps).is_err(),
+            "indexing a dep by a provider it does not publish must fail closed"
+        );
+    }
+
+    /// Fail-closed: constructing a provider with a field not in its declared schema is a loud error.
+    pub fn provider_rejects_unknown_field<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+
+def _impl(ctx):
+    return [NumberInfo(bogus = 1)]
+
+my_rule = rule(implementation = _impl, attrs = {})
+";
+        assert!(
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[]).is_err(),
+            "constructing a provider with an undeclared field must fail closed"
+        );
+    }
+
+    /// Fail-closed: a dep label referenced by an attr but NOT supplied in `deps` is a loud error, never an
+    /// absorbed empty provider set (a declared dependency must not silently go unanalyzed). The impl here does
+    /// NOT itself touch the dep, so only the seam's own check can catch the omission.
+    pub fn rule_eval_missing_dep_label_is_fail_closed<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+
+def _impl(ctx):
+    return [NumberInfo(total = 0)]
+
+my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
+";
+        let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into())]))];
+        // The target declares dep :a, but the caller supplies NO providers for it.
+        assert!(
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &[]).is_err(),
+            "a declared dep with no supplied providers must fail closed, not absorb to empty"
         );
     }
 }
