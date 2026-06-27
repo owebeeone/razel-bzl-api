@@ -55,6 +55,9 @@ pub struct RuleDef {
     pub bzl: String,
     pub name: String,
     pub attrs: Vec<(String, AttrType)>,
+    /// The toolchain TYPE ids this rule requires (`rule(toolchains=[…])`). Analysis resolves each to a
+    /// `ctx.toolchains[type]` for the target's configuration (phase #4). Empty = no toolchains required.
+    pub toolchains: Vec<String>,
 }
 
 /// A provider TYPE declaration's codec-neutral form (`provider(name, fields=[…])`), carried as a value so it
@@ -398,6 +401,7 @@ pub mod conformance {
                     bzl: "pkg/rules.bzl".to_string(),
                     name: "my_rule".to_string(),
                     attrs: vec![("deps".to_string(), AttrType::LabelList), ("value".to_string(), AttrType::Int)],
+                    toolchains: vec![],
                 }),
             )],
         };
@@ -431,6 +435,7 @@ pub mod conformance {
                     bzl: "pkg/rules.bzl".to_string(),
                     name: "my_rule".to_string(),
                     attrs: vec![("value".to_string(), AttrType::Int)],
+                    toolchains: vec![],
                 }),
             )],
         };
@@ -451,6 +456,7 @@ pub mod conformance {
                     bzl: "pkg/rules.bzl".to_string(),
                     name: "my_rule".to_string(),
                     attrs: vec![("deps".to_string(), AttrType::LabelList)],
+                    toolchains: vec![],
                 }),
             )],
         };
@@ -468,7 +474,7 @@ pub mod conformance {
         let rule_mod = BzlModule {
             bindings: vec![(
                 "my_rule".to_string(),
-                BzlValue::Rule(RuleDef { bzl: "pkg/rules.bzl".to_string(), name: "my_rule".to_string(), attrs: vec![] }),
+                BzlValue::Rule(RuleDef { bzl: "pkg/rules.bzl".to_string(), name: "my_rule".to_string(), attrs: vec![], toolchains: vec![] }),
             )],
         };
         let src = "load(\"rules\", \"my_rule\")\nmy_rule(name = \"a\")\n";
