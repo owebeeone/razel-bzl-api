@@ -5,6 +5,8 @@
 //!
 //! SPIKE scope: enough of the value model to prove the integration (`x = 1 + 2`, strings, bools, lists).
 //! Provider/struct/function values and `load()` resolution are deliberately out of this first cut.
+//! When the model grows, `BzlValue`/`BzlError` extend and the conformance suite MUST extend in lockstep
+//! (P9): `#[non_exhaustive]` permits safe growth, but P3 forbids coercing a new kind to a default.
 
 /// A codec-neutral value a `.bzl` can export at module scope.
 #[derive(Clone, PartialEq, Eq, Debug)]
