@@ -144,6 +144,36 @@ pub struct DepProviders {
     pub providers: Vec<ProviderInstance>,
 }
 
+/// A resolved toolchain fed into a rule impl: the toolchain TYPE (its identity) + the `toolchain_info` provider
+/// it carries. The analysis node resolves required toolchain types to these (phase #4, `TOOLCHAIN_CONTEXT`);
+/// the impl reads them via `ctx.toolchains[type]`. Empty until phase #4 lands — `ctx.toolchains` is an empty
+/// map now (a missing type indexes to a fail-closed error).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ResolvedToolchain {
+    pub toolchain_type: String,
+    pub info: ProviderInstance,
+}
+
+/// An action a rule's impl declares via `ctx.actions.*` — codec-neutral, the unit the EXECUTION phase (#5) runs.
+/// Plain data (deterministic for the action key + early cutoff). Empty until phase #5 wires `ctx.actions`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ActionTemplate {
+    pub mnemonic: String,
+    pub argv: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+/// The result of running a rule's implementation: the providers it published AND the actions it declared. A
+/// struct (not a bare `Vec`) so the two analysis outputs grow independently — #5 fills `actions` without
+/// touching the seam signature again (anti-corner: reserve the shape now).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RuleResult {
+    pub providers: Vec<ProviderInstance>,
+    pub actions: Vec<ActionTemplate>,
+}
+
 /// Fail-closed evaluation errors — never a panic, never a silent default.
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[non_exhaustive]
@@ -198,8 +228,11 @@ pub trait BzlEvaluator: Send + Sync {
     /// `dep[Provider]`. Pure w.r.t. the engine: the caller owns the dependency graph (resolves deps to nodes,
     /// restarts) while the evaluator is a deterministic function of these inputs.
     ///
-    /// SPIKE: `ctx` exposes `ctx.label` + `ctx.attr.<name>` + dep providers; actions/toolchains are not on
-    /// `ctx` yet (they are fail-closed `Unsupported` when the impl reaches for them — ADR-0004/#4 territory).
+    /// `ctx` exposes `ctx.label` + `ctx.attr.<name>` + dep providers + `ctx.toolchains[type]` (the resolved
+    /// toolchains supplied in `toolchains`; an empty map until phase #4). The result carries the impl's
+    /// providers AND its declared actions (`actions` empty until phase #5 wires `ctx.actions`). `ctx.actions`
+    /// itself is a fail-closed absence today (reaching for it errors). The `toolchains` slot + the `RuleResult`
+    /// shape are reserved here so #4/#5 fill them additively without re-touching this signature.
     fn evaluate_rule(
         &self,
         rule_source: &str,
@@ -209,7 +242,8 @@ pub trait BzlEvaluator: Send + Sync {
         label: &str,
         attrs: &[(String, BzlValue)],
         deps: &[DepProviders],
-    ) -> Result<Vec<ProviderInstance>, BzlError>;
+        toolchains: &[ResolvedToolchain],
+    ) -> Result<RuleResult, BzlError>;
 }
 
 pub mod conformance {
@@ -474,8 +508,9 @@ my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"deps\":
             DepProviders { label: ":b".to_string(), providers: vec![pi(20)] },
         ];
         let out = e
-            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps)
-            .expect("the rule impl must run and publish a provider");
+            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[])
+            .expect("the rule impl must run and publish a provider")
+            .providers;
         assert_eq!(out.len(), 1, "the impl returns exactly one provider");
         assert_eq!(out[0].provider, ProviderId("NumberInfo".into()));
         assert_eq!(
@@ -506,7 +541,7 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
             }],
         }];
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps).is_err(),
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[]).is_err(),
             "indexing a dep by a provider it does not publish must fail closed"
         );
     }
@@ -522,7 +557,7 @@ def _impl(ctx):
 my_rule = rule(implementation = _impl, attrs = {})
 ";
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[]).is_err(),
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[]).is_err(),
             "constructing a provider with an undeclared field must fail closed"
         );
     }
@@ -542,7 +577,7 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
         let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into())]))];
         // The target declares dep :a, but the caller supplies NO providers for it.
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &[]).is_err(),
+            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &[], &[]).is_err(),
             "a declared dep with no supplied providers must fail closed, not absorb to empty"
         );
     }
