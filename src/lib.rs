@@ -587,4 +587,26 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
             "a declared dep with no supplied providers must fail closed, not absorb to empty"
         );
     }
+
+    /// A rule's impl declares an action (`declare_action`); it surfaces in `RuleResult.actions` (the analysis
+    /// output the execution phase consumes) alongside the providers.
+    pub fn supports_action_declaration<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"x\"])
+
+def _impl(ctx):
+    declare_action(mnemonic = \"Touch\", argv = [\"touch\", \"out\"], outputs = [\"out\"])
+    return [NumberInfo(x = 1)]
+
+my_rule = rule(implementation = _impl, attrs = {})
+";
+        let r = e
+            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[])
+            .expect("a rule declaring an action must evaluate");
+        assert_eq!(r.providers.len(), 1, "the provider is still published");
+        assert_eq!(r.actions.len(), 1, "the declared action surfaces in the rule result");
+        assert_eq!(r.actions[0].mnemonic, "Touch");
+        assert_eq!(r.actions[0].argv, vec!["touch".to_string(), "out".to_string()]);
+        assert_eq!(r.actions[0].outputs, vec!["out".to_string()]);
+    }
 }
