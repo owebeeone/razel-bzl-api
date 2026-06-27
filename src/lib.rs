@@ -29,6 +29,17 @@ impl BzlModule {
     }
 }
 
+/// A target instantiated by a rule call in a BUILD file: its rule `kind`, its `name`, and its attribute
+/// values, sorted by attr name (deterministic). Instantiation records DATA — the rule's `_impl` is NOT run
+/// here; running rules to produce providers/actions is the analysis phase (ADR-0004). `name` is lifted out of
+/// the attrs because a package is keyed by target name (uniqueness is enforced fail-closed at instantiation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TargetDecl {
+    pub kind: String,
+    pub name: String,
+    pub attrs: Vec<(String, BzlValue)>,
+}
+
 /// Fail-closed evaluation errors — never a panic, never a silent default.
 #[derive(Clone, PartialEq, Eq, Debug)]
 #[non_exhaustive]
@@ -58,6 +69,22 @@ pub trait BzlEvaluator: Send + Sync {
         source: &str,
         loaded: &[(String, BzlModule)],
     ) -> Result<BzlModule, BzlError>;
+
+    /// Evaluate a BUILD file to the targets it instantiates, in declaration order. The BUILD-dialect globals
+    /// expose `target(kind = ..., name = ..., **attrs)`, which RECORDS a target (data) rather than running any
+    /// rule logic — so this is loading, not analysis. `loaded` supplies each `load()`ed module (e.g. for
+    /// constants used in attrs); same seam contract as `evaluate`. Duplicate target names within the package
+    /// are a fail-closed `Eval` error, never a silent last-wins.
+    ///
+    /// SPIKE: `target(kind=...)` is a generic instantiation placeholder — there is no `rule()` machinery yet
+    /// (a rule-callable defined in a `.bzl`, surviving `load()` as a frozen value, is entangled with providers
+    /// and is the ADR-0004 cut). Attr *schema* validation is likewise deferred: attrs are recorded as-passed.
+    fn evaluate_build(
+        &self,
+        package_name: &str,
+        source: &str,
+        loaded: &[(String, BzlModule)],
+    ) -> Result<Vec<TargetDecl>, BzlError>;
 }
 
 pub mod conformance {
@@ -117,6 +144,65 @@ pub mod conformance {
         assert!(
             matches!(e.evaluate("m", "def f():\n    pass\n", &[]), Err(BzlError::Unsupported { .. })),
             "an exported function must surface as a typed BzlError::Unsupported"
+        );
+    }
+
+    // ──────────────── BUILD evaluation (`evaluate_build`) ────────────────
+
+    /// A BUILD file instantiates targets via `target(...)`; each call yields a `TargetDecl` carrying its kind,
+    /// name, and (name-sorted) attrs. The rule `_impl` is not run — this is pure data instantiation. Attrs are
+    /// name-sorted regardless of call order, so the value is order-insensitive (early-cutoff friendly).
+    pub fn supports_target_instantiation<E: BzlEvaluator>(e: &E) {
+        let src = "target(kind = \"my_rule\", name = \"a\", srcs = [\"x.txt\"])\n\
+                   target(kind = \"my_rule\", name = \"b\", zzz = 1, aaa = 2)\n";
+        let ts = e.evaluate_build("pkg", src, &[]).expect("a BUILD of target() calls must evaluate");
+        assert_eq!(ts.len(), 2, "two target() calls instantiate two targets");
+        assert_eq!(ts[0].kind, "my_rule");
+        assert_eq!(ts[0].name, "a");
+        assert_eq!(
+            ts[0].attrs,
+            vec![("srcs".to_string(), BzlValue::List(vec![BzlValue::Str("x.txt".into())]))]
+        );
+        assert_eq!(ts[1].name, "b");
+        assert_eq!(
+            ts[1].attrs,
+            vec![("aaa".to_string(), BzlValue::Int(2)), ("zzz".to_string(), BzlValue::Int(1))],
+            "attrs must be name-sorted regardless of keyword order"
+        );
+    }
+
+    /// Two targets with the same name is a fail-closed error (a package is keyed by name; never last-wins).
+    pub fn build_dup_name_is_fail_closed<E: BzlEvaluator>(e: &E) {
+        let src = "target(kind = \"r\", name = \"dup\")\ntarget(kind = \"r\", name = \"dup\")\n";
+        assert!(
+            matches!(e.evaluate_build("pkg", src, &[]), Err(BzlError::Eval { .. })),
+            "a duplicate target name must be a typed Eval error, never a silent last-wins"
+        );
+    }
+
+    /// A `load()`ed constant is usable as an attribute value in a BUILD (proves BUILD-level `load()`).
+    pub fn build_uses_loaded_constant<E: BzlEvaluator>(e: &E) {
+        let src = "load(\"consts\", \"SRCS\")\ntarget(kind = \"r\", name = \"a\", srcs = SRCS)\n";
+        let consts = BzlModule {
+            bindings: vec![("SRCS".to_string(), BzlValue::List(vec![BzlValue::Str("g.txt".into())]))],
+        };
+        let ts = e
+            .evaluate_build("pkg", src, &[("consts".to_string(), consts)])
+            .expect("a BUILD using a loaded constant must evaluate");
+        assert_eq!(ts.len(), 1);
+        assert_eq!(
+            ts[0].attrs,
+            vec![("srcs".to_string(), BzlValue::List(vec![BzlValue::Str("g.txt".into())]))],
+            "the loaded constant SRCS must be usable as an attr value"
+        );
+    }
+
+    /// An attribute whose value the model cannot represent (e.g. a function) fails closed, not silently dropped.
+    pub fn build_rejects_unsupported_attr<E: BzlEvaluator>(e: &E) {
+        let src = "def f():\n    pass\ntarget(kind = \"r\", name = \"a\", bad = f)\n";
+        assert!(
+            e.evaluate_build("pkg", src, &[]).is_err(),
+            "an attr value of an unsupported kind must fail closed"
         );
     }
 }
