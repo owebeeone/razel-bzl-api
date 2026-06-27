@@ -138,6 +138,76 @@ impl ProviderInstance {
     }
 }
 
+/// THE canonical, lossless, injective encoding of a `BzlValue` — the single source of truth for every content
+/// key / digest in the workspace (loading, package, analysis, toolchain all delegate here, so they cannot drift).
+/// Tagged (one byte per variant); every byte run is u64-length-framed so no field can bleed into the next; the
+/// `AttrType` discriminant uses its own `code()` (the one attr-type source of truth); Rule/Provider carry their
+/// full identity (bzl/name/attrs/toolchains; id/fields). Append-only into `b` so callers can frame around it.
+pub fn encode_bzl_value(v: &BzlValue, b: &mut Vec<u8>) {
+    fn framed(b: &mut Vec<u8>, s: &[u8]) {
+        b.extend_from_slice(&(s.len() as u64).to_be_bytes());
+        b.extend_from_slice(s);
+    }
+    match v {
+        BzlValue::None => b.push(0),
+        BzlValue::Bool(x) => {
+            b.push(1);
+            b.push(*x as u8);
+        }
+        BzlValue::Int(i) => {
+            b.push(2);
+            b.extend_from_slice(&i.to_be_bytes());
+        }
+        BzlValue::Str(s) => {
+            b.push(3);
+            framed(b, s.as_bytes());
+        }
+        BzlValue::List(items) => {
+            b.push(4);
+            b.extend_from_slice(&(items.len() as u64).to_be_bytes());
+            for it in items {
+                encode_bzl_value(it, b);
+            }
+        }
+        BzlValue::Rule(rd) => {
+            b.push(5);
+            framed(b, rd.bzl.as_bytes());
+            framed(b, rd.name.as_bytes());
+            b.extend_from_slice(&(rd.attrs.len() as u64).to_be_bytes());
+            for (n, t) in &rd.attrs {
+                framed(b, n.as_bytes());
+                b.push(t.code()); // stable AttrType code (the one source of truth)
+            }
+            b.extend_from_slice(&(rd.toolchains.len() as u64).to_be_bytes());
+            for tc in &rd.toolchains {
+                framed(b, tc.as_bytes());
+            }
+        }
+        BzlValue::Provider(pd) => {
+            b.push(6);
+            framed(b, pd.id.as_bytes());
+            b.extend_from_slice(&(pd.fields.len() as u64).to_be_bytes());
+            for f in &pd.fields {
+                framed(b, f.as_bytes());
+            }
+        }
+    }
+}
+
+/// Canonical encoding of a `ProviderInstance` (id, then length-framed `(name, value)` fields via
+/// [`encode_bzl_value`]). The per-provider unit for content digests; callers prefix a provider COUNT to make a
+/// run of providers self-delimiting.
+pub fn encode_provider_instance(p: &ProviderInstance, b: &mut Vec<u8>) {
+    b.extend_from_slice(&(p.provider.0.len() as u64).to_be_bytes());
+    b.extend_from_slice(p.provider.0.as_bytes());
+    b.extend_from_slice(&(p.fields.len() as u64).to_be_bytes());
+    for (n, v) in &p.fields {
+        b.extend_from_slice(&(n.len() as u64).to_be_bytes());
+        b.extend_from_slice(n.as_bytes());
+        encode_bzl_value(v, b);
+    }
+}
+
 /// One dependency's analysis result as fed into a rule impl: the providers that dep published, keyed by its
 /// label. The analysis node resolves a target's label-typed attrs to these (restart-driven); the impl reads
 /// them via `dep[Provider]`.
@@ -608,5 +678,61 @@ my_rule = rule(implementation = _impl, attrs = {})
         assert_eq!(r.actions[0].mnemonic, "Touch");
         assert_eq!(r.actions[0].argv, vec!["touch".to_string(), "out".to_string()]);
         assert_eq!(r.actions[0].outputs, vec!["out".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod canonical_codec_tests {
+    use super::*;
+
+    fn enc(v: &BzlValue) -> Vec<u8> {
+        let mut b = Vec::new();
+        encode_bzl_value(v, &mut b);
+        b
+    }
+
+    #[test]
+    fn distinct_scalars_encode_distinctly_and_deterministically() {
+        assert_ne!(enc(&BzlValue::Int(1)), enc(&BzlValue::Int(2)));
+        assert_ne!(enc(&BzlValue::Bool(true)), enc(&BzlValue::Bool(false)));
+        // tags separate variants that could otherwise alias (None vs false vs 0 vs "").
+        assert_ne!(enc(&BzlValue::None), enc(&BzlValue::Bool(false)));
+        assert_ne!(enc(&BzlValue::Int(0)), enc(&BzlValue::Str(String::new())));
+        assert_eq!(enc(&BzlValue::Str("x".into())), enc(&BzlValue::Str("x".into())), "deterministic");
+    }
+
+    #[test]
+    fn length_framing_prevents_string_aliasing() {
+        // ["ab","c"] vs ["a","bc"] would collide under naive concatenation; framing must separate them.
+        let a = BzlValue::List(vec![BzlValue::Str("ab".into()), BzlValue::Str("c".into())]);
+        let b = BzlValue::List(vec![BzlValue::Str("a".into()), BzlValue::Str("bc".into())]);
+        assert_ne!(enc(&a), enc(&b));
+        // a string "x" must not collide with a 1-element list ["x"] (tag separation).
+        assert_ne!(enc(&BzlValue::Str("x".into())), enc(&BzlValue::List(vec![BzlValue::Str("x".into())])));
+    }
+
+    #[test]
+    fn rule_identity_is_injective_across_bzl_name_attrs_toolchains() {
+        let base = RuleDef { bzl: "a.bzl".into(), name: "r".into(), attrs: vec![], toolchains: vec![] };
+        let diff_bzl = RuleDef { bzl: "b.bzl".into(), ..base.clone() };
+        let diff_attr = RuleDef { attrs: vec![("x".into(), AttrType::Int)], ..base.clone() };
+        let diff_tc = RuleDef { toolchains: vec!["//cc:t".into()], ..base.clone() };
+        let mk = |rd: &RuleDef| enc(&BzlValue::Rule(rd.clone()));
+        assert_ne!(mk(&base), mk(&diff_bzl), "bzl distinguishes");
+        assert_ne!(mk(&base), mk(&diff_attr), "attrs distinguish");
+        assert_ne!(mk(&base), mk(&diff_tc), "toolchains distinguish");
+    }
+
+    #[test]
+    fn provider_instance_boundary_is_framed() {
+        let mk = |n: &str, v: BzlValue| {
+            let mut b = Vec::new();
+            encode_provider_instance(&ProviderInstance { provider: ProviderId("P".into()), fields: vec![(n.to_string(), v)] }, &mut b);
+            b
+        };
+        // (name="ab", "c") vs (name="a", "bc") must not alias.
+        assert_ne!(mk("ab", BzlValue::Str("c".into())), mk("a", BzlValue::Str("bc".into())));
+        // an Int field difference must change the encoding (the bug the toolchain digest had).
+        assert_ne!(mk("v", BzlValue::Int(1)), mk("v", BzlValue::Int(2)));
     }
 }
