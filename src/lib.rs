@@ -41,11 +41,23 @@ pub enum BzlError {
     Unsupported { what: String },
 }
 
-/// The seam: evaluate a `.bzl`'s source to its exported module bindings. `module_name` is a label/path used
-/// only for diagnostics. Pure w.r.t. the filesystem — the caller supplies the source bytes (so the engine
-/// owns the dependency on the file, and the evaluator stays a deterministic function of its input).
+/// The seam: evaluate a `.bzl` to its exported module bindings. Pure w.r.t. the filesystem — the caller
+/// supplies the source bytes AND the already-evaluated modules for each `load()` target, so the ENGINE owns
+/// the dependency graph (it requests the loaded `.bzl`s as nodes and restarts) while the evaluator stays a
+/// deterministic function of its inputs. `module_name` is a label/path used only for diagnostics.
 pub trait BzlEvaluator: Send + Sync {
-    fn evaluate(&self, module_name: &str, source: &str) -> Result<BzlModule, BzlError>;
+    /// Parse-only: the `load()` targets this source declares, in declaration order (the first string
+    /// argument to each `load(...)`). Lets the caller resolve + build them BEFORE evaluation. No evaluation.
+    fn load_targets(&self, source: &str) -> Result<Vec<String>, BzlError>;
+
+    /// Evaluate the source to its exports. `loaded` supplies, per `load()` target string, the module that
+    /// target evaluated to — so `load("t", "sym")` resolves `sym` from `loaded`'s entry for `"t"`.
+    fn evaluate(
+        &self,
+        module_name: &str,
+        source: &str,
+        loaded: &[(String, BzlModule)],
+    ) -> Result<BzlModule, BzlError>;
 }
 
 pub mod conformance {
@@ -55,12 +67,13 @@ pub mod conformance {
     /// arithmetic folds, and the result is name-sorted.
     pub fn supports_basic_bindings<E: BzlEvaluator>(e: &E) {
         let m = e
-            .evaluate("m", "b = 2 + 3\na = \"hi\"\nc = True\nd = [1, 2]\n")
+            .evaluate("m", "b = 2 + 3\na = \"hi\"\nc = True\nd = [1, 2]\ne = 5000000000\n", &[])
             .expect("a module of literal/arithmetic bindings must evaluate");
         assert_eq!(m.get("a"), Some(&BzlValue::Str("hi".into())));
         assert_eq!(m.get("b"), Some(&BzlValue::Int(5)), "arithmetic must fold");
         assert_eq!(m.get("c"), Some(&BzlValue::Bool(true)));
         assert_eq!(m.get("d"), Some(&BzlValue::List(vec![BzlValue::Int(1), BzlValue::Int(2)])));
+        assert_eq!(m.get("e"), Some(&BzlValue::Int(5_000_000_000)), "ints beyond i32 round-trip (full i64)");
         let names: Vec<&str> = m.bindings.iter().map(|(n, _)| n.as_str()).collect();
         let mut sorted = names.clone();
         sorted.sort_unstable();
@@ -70,8 +83,40 @@ pub mod conformance {
     /// Fail-closed: a syntax error is a typed `Parse`, never a panic.
     pub fn parse_error_is_fail_closed<E: BzlEvaluator>(e: &E) {
         assert!(
-            matches!(e.evaluate("m", "x = = 1\n"), Err(BzlError::Parse { .. })),
+            matches!(e.evaluate("m", "x = = 1\n", &[]), Err(BzlError::Parse { .. })),
             "a syntax error must be a typed BzlError::Parse"
+        );
+    }
+
+    /// `load()` resolution: the source's load target is reported, and a symbol loaded from a supplied module
+    /// is usable in evaluation.
+    pub fn supports_load<E: BzlEvaluator>(e: &E) {
+        let src = "load(\"dep\", \"y\")\nx = y + 1\n";
+        assert_eq!(e.load_targets(src).expect("load_targets parses"), vec!["dep".to_string()]);
+        let dep = BzlModule { bindings: vec![("y".to_string(), BzlValue::Int(10))] };
+        let m = e
+            .evaluate("m", src, &[("dep".to_string(), dep)])
+            .expect("evaluation with a loaded module must succeed");
+        assert_eq!(m.get("x"), Some(&BzlValue::Int(11)), "loaded symbol y=10 must be usable: x = y + 1 = 11");
+    }
+
+    /// A `load()`ed symbol is usable locally but is NOT re-exported by the loader (Bazel semantics) —
+    /// otherwise a third file could wrongly `load()` it transitively, and the loader's value would couple
+    /// to the loaded module's contents (defeating cutoff).
+    pub fn loaded_symbols_not_reexported<E: BzlEvaluator>(e: &E) {
+        let dep = BzlModule { bindings: vec![("y".to_string(), BzlValue::Int(7))] };
+        let m = e
+            .evaluate("m", "load(\"dep\", \"y\")\nx = y\n", &[("dep".to_string(), dep)])
+            .expect("evaluation must succeed");
+        assert_eq!(m.get("x"), Some(&BzlValue::Int(7)), "loaded y is usable: x = y = 7");
+        assert_eq!(m.get("y"), None, "a load()ed symbol must NOT appear in the loader's exports");
+    }
+
+    /// A value kind the model does not represent (e.g. a function) is rejected fail-closed, not dropped.
+    pub fn rejects_unsupported_types<E: BzlEvaluator>(e: &E) {
+        assert!(
+            matches!(e.evaluate("m", "def f():\n    pass\n", &[]), Err(BzlError::Unsupported { .. })),
+            "an exported function must surface as a typed BzlError::Unsupported"
         );
     }
 }
