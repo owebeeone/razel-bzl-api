@@ -6,7 +6,15 @@
 //! SPIKE scope: enough of the value model to prove the integration (`x = 1 + 2`, strings, bools, lists).
 //! Provider/struct/function values and `load()` resolution are deliberately out of this first cut.
 //! When the model grows, `BzlValue`/`BzlError` extend and the conformance suite MUST extend in lockstep
-//! (P9): `#[non_exhaustive]` permits safe growth, but P3 forbids coercing a new kind to a default.
+//! (P9). Growth mechanism (ratified, `RazelV4ProviderIdentityLockdown.md` R3): `BzlValue` stays
+//! **exhaustive** — a new variant is compile-driven match growth in every consumer, the fail-closed
+//! discipline (`#[non_exhaustive]` would force downstream wildcard arms, which IS a coercion-to-default
+//! path — anti-P3). Only `BzlError` carries `#[non_exhaustive]` (new error kinds are additive).
+
+/// The phase-environment contract surface (ADR-0003 lockdown): LoadKind/Dialect/PredeclaredEnvId/
+/// StarlarkSemanticsId/TypeOptions + the `EvalEnv` seam handle. Re-exported at the crate root.
+mod env;
+pub use env::*;
 
 /// The declared type of a rule attribute (Bazel's `attr.*`). Minimal set; grows additively. The point for
 /// analysis is distinguishing LABEL-typed attrs (which resolve to dependency targets) from scalars.
@@ -61,15 +69,18 @@ pub struct RuleDef {
 }
 
 /// A provider TYPE declaration's codec-neutral form (`provider(name, fields=[…])`), carried as a value so it
-/// survives `load()` across `.bzl`s (a provider is first-class loadable, like a rule). Identity is `id` (the
-/// declared name); `fields` are the declared field names.
+/// survives `load()` across `.bzl`s (a provider is first-class loadable, like a rule). Identity is `id` — a
+/// full [`ProviderId`], so declaration identity and instance identity share the reserved `bzl` dim and cannot
+/// drift (`RazelV4ProviderIdentityLockdown.md` §2); `fields` are the declared field names.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProviderDef {
-    pub id: String,
+    pub id: ProviderId,
     pub fields: Vec<String>,
 }
 
-/// A codec-neutral value a `.bzl` can export at module scope.
+/// A codec-neutral value a `.bzl` can export at module scope. EXHAUSTIVE by ratified decision (R3): a new
+/// variant is compile-driven match growth in every consumer — never a wildcard arm absorbing it. Digest tags
+/// 0-7 are pinned in [`encode_bzl_value`]; a variant's tag is immutable once landed.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum BzlValue {
     None,
@@ -81,6 +92,85 @@ pub enum BzlValue {
     Rule(RuleDef),
     /// A provider type defined by `provider(...)` — its identity + field schema (see `ProviderDef`).
     Provider(ProviderDef),
+    /// A depset — the ordered-DAG value (see `Depset`). VALUE-MODEL-ONLY in v1: the tag + order-code table
+    /// are pinned NOW (`RazelV4ProviderIdentityLockdown.md` rows C/D, R6) so no unpinned byte can enter
+    /// frozen digest content when the live depset machinery lands; nothing constructs one yet.
+    Depset(Depset),
+}
+
+/// A depset's traversal-order kind — exactly FOUR, with FIXED digest codes mirroring Bazel's enum ordinals
+/// (`Order.java:104-108`), written as a fixed byte (never a varint of a Rust enum layout). The deprecated
+/// order names (stable/compile/link/naive_link) are not parseable in current Bazel and MUST NOT be added.
+/// Discriminants are EXPLICIT + `#[repr(u8)]` — same discipline as [`AttrType`].
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[repr(u8)]
+pub enum DepsetOrder {
+    /// Bazel `STABLE_ORDER` — Starlark `"default"`.
+    Default = 0,
+    /// Bazel `COMPILE_ORDER` — Starlark `"postorder"`.
+    Postorder = 1,
+    /// Bazel `LINK_ORDER` — Starlark `"topological"`.
+    Topological = 2,
+    /// Bazel `NAIVE_LINK_ORDER` — Starlark `"preorder"`.
+    Preorder = 3,
+}
+impl DepsetOrder {
+    /// The stable digest code (pinned by the explicit discriminants). The one encoder mapping.
+    pub fn code(self) -> u8 {
+        if cfg!(feature = "mutant_depset_order_code_swap") {
+            // MUTANT: swap the topological/preorder codes → the byte-golden order-code gate goes red.
+            return match self {
+                DepsetOrder::Topological => 3,
+                DepsetOrder::Preorder => 2,
+                o => o as u8,
+            };
+        }
+        self as u8
+    }
+    /// Inverse of `code` — fail-closed on an unknown code (never a silent default).
+    pub fn from_code(c: u8) -> Option<DepsetOrder> {
+        Some(match c {
+            0 => DepsetOrder::Default,
+            1 => DepsetOrder::Postorder,
+            2 => DepsetOrder::Topological,
+            3 => DepsetOrder::Preorder,
+            _ => return None,
+        })
+    }
+    /// Parse a Starlark `order =` name. ONLY the four current names parse (`Order.java:171-177,192-201`);
+    /// the deprecated aliases fail closed.
+    pub fn parse(name: &str) -> Option<DepsetOrder> {
+        Some(match name {
+            "default" => DepsetOrder::Default,
+            "postorder" => DepsetOrder::Postorder,
+            "topological" => DepsetOrder::Topological,
+            "preorder" => DepsetOrder::Preorder,
+            _ => return None,
+        })
+    }
+    /// The canonical Starlark name (the `to_proto`/display form).
+    pub fn starlark_name(self) -> &'static str {
+        match self {
+            DepsetOrder::Default => "default",
+            DepsetOrder::Postorder => "postorder",
+            DepsetOrder::Topological => "topological",
+            DepsetOrder::Preorder => "preorder",
+        }
+    }
+}
+
+/// A depset value: the ordered DAG (never pre-flattened — the digest is STRUCTURAL, per-node, injective on
+/// the value; same `to_list()` with different nesting is a DIFFERENT digest, mirroring Bazel's per-node
+/// fingerprint shape without chasing its exact bytes — ratified R6). `elem` is the canonical top-level
+/// Starlark type symbol, a DERIVED cache of the content (`None` = empty, merges with anything) — it is NOT
+/// independent digest content (the §2 frame pins tag/order/direct/transitive only). Merge/type-check/flatten
+/// semantics (lockdown row D) land with the live machinery; v1 pins only the value + digest shape.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Depset {
+    pub order: DepsetOrder,
+    pub elem: Option<String>,
+    pub direct: Vec<BzlValue>,
+    pub transitive: Vec<Depset>,
 }
 
 /// The exported global bindings of an evaluated `.bzl`, sorted by name (deterministic).
@@ -118,11 +208,38 @@ pub struct TargetDecl {
 
 // ──────────────── analysis: providers (the rule-evaluation output) ────────────────
 
-/// A provider's identity — the key for `dep[Provider]` lookup. SPIKE: the provider's declared name (a string).
-/// Two providers sharing a name would collide; a future id can add the defining `.bzl` ADDITIVELY (anti-corner:
-/// keep identity minimal + by-name now, no merge-algebra assumptions baked in — ADR-0004's later half).
+/// A provider's identity — the key for `dep[Provider]` lookup and a CONTENT-KEY dimension (it feeds every
+/// configured-target + toolchain digest). Ratified shape (`RazelV4ProviderIdentityLockdown.md` R1, mirroring
+/// `RuleOrigin{bzl,name}` and Bazel's `StarlarkProvider.Key = (module key, exported name)`): the PAIR of the
+/// defining `.bzl` and the exported name. v1 cut: `bzl` is the `None` SENTINEL under the hard single-module
+/// corpus cap — a future `Some(label)` is a *different* identity (a key change, never a re-key); `name` is
+/// NEVER re-keyed out of digest scope (reserve-the-key).
+///
+/// ALL identity comparison/hash/order rides the derived `Eq`/`Ord`/`Hash` — raw field comparison outside
+/// razel-bzl-api is BANNED (the lockdown §0.3 sweep). Same-name providers differing in `bzl` are distinct in
+/// every consuming position.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct ProviderId(pub String);
+pub struct ProviderId {
+    /// The exported name — today's whole identity; NEVER re-keyed out of digest scope.
+    pub name: String,
+    /// The defining `.bzl` — `None` in v1 (the sentinel; digest tag 0). `Some(_)` is a DIFFERENT identity.
+    pub bzl: Option<String>,
+}
+impl ProviderId {
+    /// The v1 constructor: a name-only identity with the `bzl` dim at its `None` sentinel (the declared name
+    /// IS the exported name under the single-module cap — lockdown R5).
+    pub fn from_name(name: impl Into<String>) -> ProviderId {
+        ProviderId { name: name.into(), bzl: None }
+    }
+    /// The exported name — for display/diagnostics; NEVER for identity comparison (use the derived impls).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// The defining-`.bzl` dim (`None` = the v1 sentinel).
+    pub fn bzl(&self) -> Option<&str> {
+        self.bzl.as_deref()
+    }
+}
 
 /// A provider INSTANCE — a typed, codec-neutral value a rule's impl publishes (`Provider(field = …)`). This is
 /// the analysis phase's per-target output; it flows along dependency edges (`dep[Provider]`). `fields` are
@@ -138,16 +255,64 @@ impl ProviderInstance {
     }
 }
 
+fn framed(b: &mut Vec<u8>, s: &[u8]) {
+    b.extend_from_slice(&(s.len() as u64).to_be_bytes());
+    b.extend_from_slice(s);
+}
+
+/// The provider IDENTITY frame — THE one digest rendering of a `ProviderId`, shared by
+/// [`encode_provider_instance`] and the `encode_bzl_value` Provider arm (lockdown §2, decision B):
+///
+///   `[namespace: u8]`      `0x00` = Starlark-declared; `0x01` = builtin/native — RESERVED now (row G lands
+///                          DefaultInfo & co under it later) so a builtin `FooInfo` can never collide with a
+///                          Starlark `FooInfo` (Bazel's leading fingerprint bool, partitioned the same way).
+///   `[bzl: u8 tag + run]`  tag `0x00` = `None` (the v1 sentinel); tag `0x01` + u64-framed label when it fills.
+///   `[name: u64-framed]`   the exported name.
+///
+/// Two framed identity runs, exactly like the Rule arm (`rd.bzl` then `rd.name`). Private: the frame exists
+/// ONLY inside the canonical codec funnel.
+fn encode_provider_identity(id: &ProviderId, b: &mut Vec<u8>) {
+    if cfg!(feature = "mutant_provider_digest_name_only") {
+        // MUTANT: drop the namespace byte + the reserved bzl dim — the pre-lockdown name-only shape, under
+        // which a same-name identity differing in `bzl` silently fuses in every digest.
+        framed(b, id.name.as_bytes());
+        return;
+    }
+    b.push(0x00); // namespace: Starlark-declared (0x01 = builtin, reserved for row G)
+    match &id.bzl {
+        None => b.push(0x00), // the v1 sentinel: a future Some(label) is a DIFFERENT key, not a re-key
+        Some(l) => {
+            b.push(0x01);
+            framed(b, l.as_bytes());
+        }
+    }
+    framed(b, id.name.as_bytes());
+}
+
+/// The depset digest frame (lockdown §2, R6 — STRUCTURAL, per-node, injective on the value):
+/// `[tag 7][order code byte][u64 direct count + encoded values][u64 transitive count + recursion]`.
+/// The order byte is `DepsetOrder::code()` (the pinned table, never a Rust enum layout); `elem` is a derived
+/// cache and NOT digest content. Private: reachable only through [`encode_bzl_value`].
+fn encode_depset(d: &Depset, b: &mut Vec<u8>) {
+    b.push(7);
+    b.push(d.order.code());
+    b.extend_from_slice(&(d.direct.len() as u64).to_be_bytes());
+    for v in &d.direct {
+        encode_bzl_value(v, b);
+    }
+    b.extend_from_slice(&(d.transitive.len() as u64).to_be_bytes());
+    for t in &d.transitive {
+        encode_depset(t, b);
+    }
+}
+
 /// THE canonical, lossless, injective encoding of a `BzlValue` — the single source of truth for every content
 /// key / digest in the workspace (loading, package, analysis, toolchain all delegate here, so they cannot drift).
 /// Tagged (one byte per variant); every byte run is u64-length-framed so no field can bleed into the next; the
 /// `AttrType` discriminant uses its own `code()` (the one attr-type source of truth); Rule/Provider carry their
-/// full identity (bzl/name/attrs/toolchains; id/fields). Append-only into `b` so callers can frame around it.
+/// full identity (bzl/name/attrs/toolchains; the §2 identity frame + fields). Append-only into `b` so callers
+/// can frame around it.
 pub fn encode_bzl_value(v: &BzlValue, b: &mut Vec<u8>) {
-    fn framed(b: &mut Vec<u8>, s: &[u8]) {
-        b.extend_from_slice(&(s.len() as u64).to_be_bytes());
-        b.extend_from_slice(s);
-    }
     match v {
         BzlValue::None => b.push(0),
         BzlValue::Bool(x) => {
@@ -185,21 +350,22 @@ pub fn encode_bzl_value(v: &BzlValue, b: &mut Vec<u8>) {
         }
         BzlValue::Provider(pd) => {
             b.push(6);
-            framed(b, pd.id.as_bytes());
+            encode_provider_identity(&pd.id, b);
             b.extend_from_slice(&(pd.fields.len() as u64).to_be_bytes());
             for f in &pd.fields {
                 framed(b, f.as_bytes());
             }
         }
+        BzlValue::Depset(d) => encode_depset(d, b),
     }
 }
 
-/// Canonical encoding of a `ProviderInstance` (id, then length-framed `(name, value)` fields via
-/// [`encode_bzl_value`]). The per-provider unit for content digests; callers prefix a provider COUNT to make a
-/// run of providers self-delimiting.
+/// Canonical encoding of a `ProviderInstance` (the §2 identity frame, then length-framed `(name, value)`
+/// fields via [`encode_bzl_value`]). The per-provider unit for content digests; callers prefix a provider
+/// COUNT to make a run of providers self-delimiting (the framing after the identity is byte-identical to the
+/// pre-lockdown shape — only the identity run changed, ratified R2 while zero goldens exist).
 pub fn encode_provider_instance(p: &ProviderInstance, b: &mut Vec<u8>) {
-    b.extend_from_slice(&(p.provider.0.len() as u64).to_be_bytes());
-    b.extend_from_slice(p.provider.0.as_bytes());
+    encode_provider_identity(&p.provider, b);
     b.extend_from_slice(&(p.fields.len() as u64).to_be_bytes());
     for (n, v) in &p.fields {
         b.extend_from_slice(&(n.len() as u64).to_be_bytes());
@@ -263,15 +429,30 @@ pub enum BzlError {
 /// supplies the source bytes AND the already-evaluated modules for each `load()` target, so the ENGINE owns
 /// the dependency graph (it requests the loaded `.bzl`s as nodes and restarts) while the evaluator stays a
 /// deterministic function of its inputs. `module_name` is a label/path used only for diagnostics.
+///
+/// ENVIRONMENT-PARAMETERIZED (the ADR-0003 lockdown §3): module/rule evaluation takes an [`EvalEnv`]
+/// naming the phase — the trait was parameterless w.r.t. environment and thus structurally incapable of
+/// the §1 matrix's distinctions. The impl selects a NAMED, precomputed, digested per-phase environment
+/// from it (fail-closed on any row it has not built — never a shared default Globals). BUILD-file eval
+/// (matrix row 7) is not a LoadKind: `evaluate_build` itself is that phase's discriminant.
 pub trait BzlEvaluator: Send + Sync {
     /// Parse-only: the `load()` targets this source declares, in declaration order (the first string
     /// argument to each `load(...)`). Lets the caller resolve + build them BEFORE evaluation. No evaluation.
     fn load_targets(&self, source: &str) -> Result<Vec<String>, BzlError>;
 
-    /// Evaluate the source to its exports. `loaded` supplies, per `load()` target string, the module that
-    /// target evaluated to — so `load("t", "sym")` resolves `sym` from `loaded`'s entry for `"t"`.
+    /// The [`PredeclaredEnvId`] this evaluator serves for `kind`/`dialect` — key fact A: env selection is
+    /// a function of the LoadKind alone (plus the `.scl` row-6 override), never of key contents. This is
+    /// how a requester obtains the env-id KEY DIMENSION (REQ-BZLLOAD-018) without reaching behind the
+    /// seam. Fail-closed: a kind whose environment this evaluator has not built is a typed error, never a
+    /// defaulted id.
+    fn predeclared_env_id(&self, kind: &LoadKind, dialect: Dialect) -> Result<PredeclaredEnvId, BzlError>;
+
+    /// Evaluate the source to its exports, in the environment `env` names. `loaded` supplies, per `load()`
+    /// target string, the module that target evaluated to — so `load("t", "sym")` resolves `sym` from
+    /// `loaded`'s entry for `"t"`.
     fn evaluate(
         &self,
+        env: &EvalEnv,
         module_name: &str,
         source: &str,
         loaded: &[(String, BzlModule)],
@@ -306,8 +487,12 @@ pub trait BzlEvaluator: Send + Sync {
     /// providers AND its declared actions (`actions` empty until phase #5 wires `ctx.actions`). `ctx.actions`
     /// itself is a fail-closed absence today (reaching for it errors). The `toolchains` slot + the `RuleResult`
     /// shape are reserved here so #4/#5 fill them additively without re-touching this signature.
+    ///
+    /// `env` names the environment the rule's `.bzl` is re-evaluated in — the analysis re-eval of a
+    /// BUILD-loaded module runs in the SAME row-1 env as its load (`EvalEnv::build_bzl_v1` today).
     fn evaluate_rule(
         &self,
+        env: &EvalEnv,
         rule_source: &str,
         rule_module_name: &str,
         rule_name: &str,
@@ -326,7 +511,7 @@ pub mod conformance {
     /// arithmetic folds, and the result is name-sorted.
     pub fn supports_basic_bindings<E: BzlEvaluator>(e: &E) {
         let m = e
-            .evaluate("m", "b = 2 + 3\na = \"hi\"\nc = True\nd = [1, 2]\ne = 5000000000\n", &[])
+            .evaluate(&EvalEnv::default(), "m", "b = 2 + 3\na = \"hi\"\nc = True\nd = [1, 2]\ne = 5000000000\n", &[])
             .expect("a module of literal/arithmetic bindings must evaluate");
         assert_eq!(m.get("a"), Some(&BzlValue::Str("hi".into())));
         assert_eq!(m.get("b"), Some(&BzlValue::Int(5)), "arithmetic must fold");
@@ -342,7 +527,7 @@ pub mod conformance {
     /// Fail-closed: a syntax error is a typed `Parse`, never a panic.
     pub fn parse_error_is_fail_closed<E: BzlEvaluator>(e: &E) {
         assert!(
-            matches!(e.evaluate("m", "x = = 1\n", &[]), Err(BzlError::Parse { .. })),
+            matches!(e.evaluate(&EvalEnv::default(), "m", "x = = 1\n", &[]), Err(BzlError::Parse { .. })),
             "a syntax error must be a typed BzlError::Parse"
         );
     }
@@ -354,7 +539,7 @@ pub mod conformance {
         assert_eq!(e.load_targets(src).expect("load_targets parses"), vec!["dep".to_string()]);
         let dep = BzlModule { bindings: vec![("y".to_string(), BzlValue::Int(10))] };
         let m = e
-            .evaluate("m", src, &[("dep".to_string(), dep)])
+            .evaluate(&EvalEnv::default(), "m", src, &[("dep".to_string(), dep)])
             .expect("evaluation with a loaded module must succeed");
         assert_eq!(m.get("x"), Some(&BzlValue::Int(11)), "loaded symbol y=10 must be usable: x = y + 1 = 11");
     }
@@ -365,7 +550,7 @@ pub mod conformance {
     pub fn loaded_symbols_not_reexported<E: BzlEvaluator>(e: &E) {
         let dep = BzlModule { bindings: vec![("y".to_string(), BzlValue::Int(7))] };
         let m = e
-            .evaluate("m", "load(\"dep\", \"y\")\nx = y\n", &[("dep".to_string(), dep)])
+            .evaluate(&EvalEnv::default(), "m", "load(\"dep\", \"y\")\nx = y\n", &[("dep".to_string(), dep)])
             .expect("evaluation must succeed");
         assert_eq!(m.get("x"), Some(&BzlValue::Int(7)), "loaded y is usable: x = y = 7");
         assert_eq!(m.get("y"), None, "a load()ed symbol must NOT appear in the loader's exports");
@@ -374,8 +559,28 @@ pub mod conformance {
     /// A value kind the model does not represent (e.g. a function) is rejected fail-closed, not dropped.
     pub fn rejects_unsupported_types<E: BzlEvaluator>(e: &E) {
         assert!(
-            matches!(e.evaluate("m", "def f():\n    pass\n", &[]), Err(BzlError::Unsupported { .. })),
+            matches!(e.evaluate(&EvalEnv::default(), "m", "def f():\n    pass\n", &[]), Err(BzlError::Unsupported { .. })),
             "an exported function must surface as a typed BzlError::Unsupported"
+        );
+    }
+
+    /// Phase separation is ENVIRONMENTAL, not runtime-only (lockdown §3; the v1 cut of
+    /// `build_loaded_and_bzlmod_loaded_not_conflated`): the BUILD-file env (row 7) and the `.bzl` env
+    /// (row 1) are distinct predeclared name-sets. A BUILD file must not see `.bzl` toplevels
+    /// (`provider`/`rule`), and a `.bzl` must not see the BUILD-file toplevel (`target`) — under the spike's
+    /// one-Globals-for-everything shape (`mutant_one_globals_all_loadkinds`) both leak and this goes red.
+    pub fn phase_envs_not_conflated<E: BzlEvaluator>(e: &E) {
+        assert!(
+            e.evaluate_build("pkg", "p = provider(\"P\", fields = [])\n", &[]).is_err(),
+            "the BUILD-file env must NOT expose the .bzl toplevel 'provider' (environmental separation)"
+        );
+        assert!(
+            e.evaluate_build("pkg", "r = rule\n", &[]).is_err(),
+            "the BUILD-file env must NOT expose the .bzl toplevel 'rule'"
+        );
+        assert!(
+            e.evaluate(&EvalEnv::default(), "m.bzl", "_t = [target]\n", &[]).is_err(),
+            "the .bzl env must NOT expose the BUILD-file toplevel 'target'"
         );
     }
 
@@ -446,7 +651,7 @@ pub mod conformance {
     pub fn supports_rule_definition<E: BzlEvaluator>(e: &E) {
         let src = "def _impl(ctx):\n    pass\n\
                    my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list(), \"value\": attr.int()})\n";
-        let m = e.evaluate("rules.bzl", src, &[]).expect("a .bzl defining a rule must evaluate");
+        let m = e.evaluate(&EvalEnv::default(), "rules.bzl", src, &[]).expect("a .bzl defining a rule must evaluate");
         let r = match m.get("my_rule") {
             Some(BzlValue::Rule(rd)) => rd,
             other => panic!("my_rule must export as BzlValue::Rule, got {other:?}"),
@@ -549,7 +754,7 @@ pub mod conformance {
         };
         let src = "load(\"rules\", \"my_rule\")\nmy_rule(name = \"a\")\n";
         assert!(
-            e.evaluate("m.bzl", src, &[("rules".to_string(), rule_mod)]).is_err(),
+            e.evaluate(&EvalEnv::default(), "m.bzl", src, &[("rules".to_string(), rule_mod)]).is_err(),
             "calling a rule from a .bzl (no target registry) must fail closed, not panic"
         );
     }
@@ -576,7 +781,7 @@ my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"deps\":
             ("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into()), BzlValue::Str(":b".into())])),
         ];
         let pi = |n: i64| ProviderInstance {
-            provider: ProviderId("NumberInfo".into()),
+            provider: ProviderId::from_name("NumberInfo"),
             fields: vec![("total".to_string(), BzlValue::Int(n))],
         };
         let deps = vec![
@@ -584,11 +789,11 @@ my_rule = rule(implementation = _impl, attrs = {\"value\": attr.int(), \"deps\":
             DepProviders { label: ":b".to_string(), providers: vec![pi(20)] },
         ];
         let out = e
-            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[])
+            .evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[])
             .expect("the rule impl must run and publish a provider")
             .providers;
         assert_eq!(out.len(), 1, "the impl returns exactly one provider");
-        assert_eq!(out[0].provider, ProviderId("NumberInfo".into()));
+        assert_eq!(out[0].provider, ProviderId::from_name("NumberInfo"));
         assert_eq!(
             out[0].get("total"),
             Some(&BzlValue::Int(32)),
@@ -612,12 +817,12 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
             label: ":a".to_string(),
             // the dep publishes NumberInfo, NOT OtherInfo — so dep[OtherInfo] must fail closed.
             providers: vec![ProviderInstance {
-                provider: ProviderId("NumberInfo".into()),
+                provider: ProviderId::from_name("NumberInfo"),
                 fields: vec![("total".to_string(), BzlValue::Int(1))],
             }],
         }];
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[]).is_err(),
+            e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[]).is_err(),
             "indexing a dep by a provider it does not publish must fail closed"
         );
     }
@@ -633,9 +838,95 @@ def _impl(ctx):
 my_rule = rule(implementation = _impl, attrs = {})
 ";
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[]).is_err(),
+            e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[]).is_err(),
             "constructing a provider with an undeclared field must fail closed"
         );
+    }
+
+    /// Provider identity is OPAQUE (lockdown gate `provider_identity_opaque_comparison`, the C2 sweep):
+    /// `dep[Provider]` re-keying rides `ProviderId`'s derived impls, never a raw-name comparison. A dep
+    /// provider named like the module's own but differing in the reserved `bzl` dim is a DIFFERENT identity —
+    /// matching it by name would silently fuse two provider types (the §0.3 leak). Fail-closed instead.
+    pub fn provider_identity_opaque_comparison<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+
+def _impl(ctx):
+    return [NumberInfo(total = ctx.attr.deps[0][NumberInfo].total)]
+
+my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
+";
+        let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into())]))];
+        // Same NAME, different identity: the dep's provider was defined in another .bzl (bzl = Some). Under
+        // the single-module cap this cannot be this module's NumberInfo.
+        let deps = vec![DepProviders {
+            label: ":a".to_string(),
+            providers: vec![ProviderInstance {
+                provider: ProviderId { name: "NumberInfo".into(), bzl: Some("other/defs.bzl".into()) },
+                fields: vec![("total".to_string(), BzlValue::Int(1))],
+            }],
+        }];
+        assert!(
+            e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &deps, &[]).is_err(),
+            "a bzl-differing provider identity must NOT fuse with the module's provider by raw name"
+        );
+    }
+
+    /// Fail-closed (lockdown decision H, gate `provider_dup_declaration_fail_closed`): a second same-name
+    /// `provider()` declaration visible at module scope is a typed `Eval` error NAMING the provider — killing
+    /// the silent last-wins. Aliasing (two names bound to the SAME declaration) stays legal.
+    pub fn provider_dup_declaration_fail_closed<E: BzlEvaluator>(e: &E) {
+        // (a) the rule-eval provider index path.
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+Other = provider(\"NumberInfo\", fields = [\"x\"])
+
+def _impl(ctx):
+    return [NumberInfo(total = 1)]
+
+my_rule = rule(implementation = _impl, attrs = {})
+";
+        match e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[]) {
+            Err(BzlError::Eval { detail }) => {
+                assert!(detail.contains("NumberInfo"), "the error must NAME the colliding provider: {detail}")
+            }
+            other => panic!("a duplicate provider declaration must be a typed Eval error, got {other:?}"),
+        }
+        // (b) the plain module path — the same collision reaching module scope via `evaluate`.
+        let dup = "A = provider(\"P\", fields = [])\nB = provider(\"P\", fields = [])\n";
+        match e.evaluate(&EvalEnv::default(), "m.bzl", dup, &[]) {
+            Err(BzlError::Eval { detail }) => {
+                assert!(detail.contains("'P'"), "the error must NAME the colliding provider: {detail}")
+            }
+            other => panic!("a duplicate provider declaration at module scope must fail closed, got {other:?}"),
+        }
+        // (c) aliasing is NOT a collision: one declaration, two names.
+        let alias = "P = provider(\"P\", fields = [\"x\"])\nAlias = P\n";
+        assert!(
+            e.evaluate(&EvalEnv::default(), "m.bzl", alias, &[]).is_ok(),
+            "aliasing one provider declaration under two names must stay legal (it is ONE identity)"
+        );
+    }
+
+    /// Fail-closed (lockdown decision E, gate `rule_result_dup_provider_fail_closed`): an impl returning two
+    /// instances of one provider is an analysis error with Bazel's exact shape
+    /// (`StarlarkRuleConfiguredTargetUtil.java:273-275`) — never a silent last-wins merge.
+    pub fn rule_result_dup_provider_fail_closed<E: BzlEvaluator>(e: &E) {
+        let src = "\
+NumberInfo = provider(\"NumberInfo\", fields = [\"total\"])
+
+def _impl(ctx):
+    return [NumberInfo(total = 1), NumberInfo(total = 2)]
+
+my_rule = rule(implementation = _impl, attrs = {})
+";
+        match e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[]) {
+            Err(BzlError::Eval { detail }) => assert!(
+                detail.contains("Multiple conflicting returned providers with key NumberInfo"),
+                "Bazel's duplicate-return error shape expected, got: {detail}"
+            ),
+            other => panic!("duplicate returned providers must fail closed, got {other:?}"),
+        }
     }
 
     /// Fail-closed: a dep label referenced by an attr but NOT supplied in `deps` is a loud error, never an
@@ -653,7 +944,7 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
         let attrs = vec![("deps".to_string(), BzlValue::List(vec![BzlValue::Str(":a".into())]))];
         // The target declares dep :a, but the caller supplies NO providers for it.
         assert!(
-            e.evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &[], &[]).is_err(),
+            e.evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &attrs, &[], &[]).is_err(),
             "a declared dep with no supplied providers must fail closed, not absorb to empty"
         );
     }
@@ -671,7 +962,7 @@ def _impl(ctx):
 my_rule = rule(implementation = _impl, attrs = {})
 ";
         let r = e
-            .evaluate_rule(src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[])
+            .evaluate_rule(&EvalEnv::default(), src, "pkg/rules.bzl", "my_rule", &[], "//pkg:t", &[], &[], &[])
             .expect("a rule declaring an action must evaluate");
         assert_eq!(r.providers.len(), 1, "the provider is still published");
         assert_eq!(r.actions.len(), 1, "the declared action surfaces in the rule result");
@@ -727,12 +1018,97 @@ mod canonical_codec_tests {
     fn provider_instance_boundary_is_framed() {
         let mk = |n: &str, v: BzlValue| {
             let mut b = Vec::new();
-            encode_provider_instance(&ProviderInstance { provider: ProviderId("P".into()), fields: vec![(n.to_string(), v)] }, &mut b);
+            encode_provider_instance(&ProviderInstance { provider: ProviderId::from_name("P"), fields: vec![(n.to_string(), v)] }, &mut b);
             b
         };
         // (name="ab", "c") vs (name="a", "bc") must not alias.
         assert_ne!(mk("ab", BzlValue::Str("c".into())), mk("a", BzlValue::Str("bc".into())));
         // an Int field difference must change the encoding (the bug the toolchain digest had).
         assert_ne!(mk("v", BzlValue::Int(1)), mk("v", BzlValue::Int(2)));
+    }
+
+    /// Lockdown gate `provider_identity_reserved_bzl_dim` (§4): the reserved `bzl` dim is IN the identity —
+    /// equal names differing in `bzl` digest differently AND compare unequal, and the v1 sentinel bytes are
+    /// literally present in the frame. RED under `mutant_provider_digest_name_only` (the pre-lockdown shape).
+    #[test]
+    fn provider_identity_reserved_bzl_dim() {
+        let mk = |bzl: Option<&str>| ProviderInstance {
+            provider: ProviderId { name: "P".into(), bzl: bzl.map(|s| s.to_string()) },
+            fields: vec![],
+        };
+        let enc_pi = |p: &ProviderInstance| {
+            let mut b = Vec::new();
+            encode_provider_instance(p, &mut b);
+            b
+        };
+        let none = enc_pi(&mk(None));
+        let a = enc_pi(&mk(Some("a.bzl")));
+        let b = enc_pi(&mk(Some("b.bzl")));
+        assert_ne!(none, a, "bzl None vs Some must digest differently (the reserved dim is live in the frame)");
+        assert_ne!(a, b, "bzl Some(a) vs Some(b) must digest differently");
+        assert_ne!(mk(None).provider, mk(Some("a.bzl")).provider, "the derived Eq must distinguish the bzl dim");
+        // The v1 sentinel bytes, literally: [0x00 namespace = Starlark][0x00 bzl = None][u64 name frame]…
+        assert_eq!(none[0], 0x00, "namespace byte: Starlark-declared (0x01 = builtin, reserved)");
+        assert_eq!(none[1], 0x00, "bzl dim: the v1 None sentinel tag");
+        assert_eq!(&none[2..10], &1u64.to_be_bytes(), "the exported name is u64-framed after the identity dims");
+        // The SAME identity frame partitions the encode_bzl_value Provider arm (declaration identity).
+        let pd = |bzl: Option<&str>| {
+            BzlValue::Provider(ProviderDef {
+                id: ProviderId { name: "P".into(), bzl: bzl.map(|s| s.to_string()) },
+                fields: vec![],
+            })
+        };
+        assert_ne!(enc(&pd(None)), enc(&pd(Some("a.bzl"))), "ProviderDef carries the same reserved dim (no drift)");
+    }
+
+    /// Lockdown gate `depset_order_codes_pinned` (§4, row C): the four order codes are byte-golden Bazel
+    /// enum ordinals; `from_code` is fail-closed on 4..=255; ONLY the four Starlark names parse (deprecated
+    /// aliases rejected). RED under `mutant_depset_order_code_swap`.
+    #[test]
+    fn depset_order_codes_pinned() {
+        let table = [
+            (DepsetOrder::Default, 0u8, "default"),
+            (DepsetOrder::Postorder, 1, "postorder"),
+            (DepsetOrder::Topological, 2, "topological"),
+            (DepsetOrder::Preorder, 3, "preorder"),
+        ];
+        for (order, code, name) in table {
+            assert_eq!(order.code(), code, "byte-golden digest code for {name} (Bazel Order.java ordinal)");
+            assert_eq!(DepsetOrder::from_code(code), Some(order), "code {code} round-trips");
+            assert_eq!(DepsetOrder::parse(name), Some(order), "Starlark name '{name}' parses");
+            assert_eq!(order.starlark_name(), name);
+        }
+        for c in 4..=255u8 {
+            assert_eq!(DepsetOrder::from_code(c), None, "unknown code {c} must fail closed, never default");
+        }
+        for stale in ["stable", "compile", "link", "naive_link", "STABLE_ORDER", ""] {
+            assert_eq!(DepsetOrder::parse(stale), None, "deprecated/unknown order name '{stale}' must not parse");
+        }
+    }
+
+    /// R6: the depset digest is STRUCTURAL (per-node DAG), injective on the value — same flattened elements
+    /// with different nesting are different digests; the order code byte is digest content.
+    #[test]
+    fn depset_digest_is_structural() {
+        let s = |x: &str| BzlValue::Str(x.into());
+        let leafless = |direct: Vec<BzlValue>, transitive: Vec<Depset>| Depset {
+            order: DepsetOrder::Default,
+            elem: Some("string".into()),
+            direct,
+            transitive,
+        };
+        let flat = leafless(vec![s("a"), s("b")], vec![]);
+        let nested = leafless(vec![s("a")], vec![leafless(vec![s("b")], vec![])]);
+        assert_ne!(
+            enc(&BzlValue::Depset(flat.clone())),
+            enc(&BzlValue::Depset(nested)),
+            "same to_list, different nesting ⇒ different digest (structural, never the flattened list)"
+        );
+        let mut post = flat.clone();
+        post.order = DepsetOrder::Postorder;
+        assert_ne!(enc(&BzlValue::Depset(flat)), enc(&BzlValue::Depset(post)), "the order code is digest content");
+        // tag separation: an empty depset must not alias an empty list.
+        let empty = Depset { order: DepsetOrder::Default, elem: None, direct: vec![], transitive: vec![] };
+        assert_ne!(enc(&BzlValue::Depset(empty)), enc(&BzlValue::List(vec![])), "depset tag 7 ≠ list tag 4");
     }
 }

@@ -7,3 +7,20 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # none — the eval seam is self-contained; a concrete evaluator (starlark-rust) lives behind it in an impl.
+
+[features]
+# RED-FIRST: drop the namespace byte + reserved bzl dim from the provider identity frame (the pre-lockdown
+# name-only shape) → the reserved-dim codec gate (provider_identity_reserved_bzl_dim) must go red.
+mutant_provider_digest_name_only = []
+# RED-FIRST: swap the topological/preorder depset order codes → the byte-golden order-code table
+# (depset_order_codes_pinned) must go red.
+mutant_depset_order_code_swap = []
+# RED-FIRST (phase-env lockdown, headline fold pair): drop the injected-builtins fold for EnvBuildBzl
+# (fold-never — under-invalidation) → build_bzl_digest_includes_injected_builtins must go red.
+mutant_builtins_digest_dropped_for_build = []
+# RED-FIRST (phase-env lockdown, headline fold pair): fold the injected-builtins digest into EnvBzlmodBzl
+# too (fold-always — repo-refetch over-invalidation) → bzlmod_bzl_digest_excludes_injected_builtins red.
+mutant_builtins_digest_folded_for_bzlmod = []
+# RED-FIRST (phase-env lockdown, key fact C): builtins injection silently ADDS a non-registered name
+# instead of failing closed → builtins_injection_override_only must go red.
+mutant_injection_adds_new_name = []
