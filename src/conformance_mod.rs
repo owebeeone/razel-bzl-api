@@ -50,11 +50,29 @@ pub mod conformance {
         assert_eq!(m.get("y"), None, "a load()ed symbol must NOT appear in the loader's exports");
     }
 
-    /// A value kind the model does not represent (e.g. a function) is rejected fail-closed, not dropped.
+    /// A value kind the model represents crosses the boundary; one it does not is rejected fail-closed.
     pub fn rejects_unsupported_types<E: BzlEvaluator>(e: &E) {
+        // T20 R-load-codec: an exported FUNCTION now surfaces as a `FunctionRef` (its (module, name) identity
+        // + the defining module's content digest — NEVER the body), so sibling modules can `load()` it. It
+        // is no longer a typed-Unsupported hole.
+        let m = e
+            .evaluate(&EvalEnv::default(), "m", "def f():\n    pass\n", &[])
+            .expect("an exported function must evaluate (it surfaces as a FunctionRef, not a rejection)");
+        match m.get("f") {
+            Some(BzlValue::FunctionRef(fr)) => {
+                assert_eq!(fr.name, "f", "the FunctionRef carries the symbol name");
+                assert_eq!(fr.module, "m", "the FunctionRef carries the DEFINING module (identity, not the body)");
+            }
+            other => panic!("an exported function must surface as a BzlValue::FunctionRef, got {other:?}"),
+        }
+        // A value kind the model still does NOT represent (a `range` object) stays fail-closed — rejected as
+        // a typed error, never silently dropped.
         assert!(
-            matches!(e.evaluate(&EvalEnv::default(), "m", "def f():\n    pass\n", &[]), Err(BzlError::Unsupported { .. })),
-            "an exported function must surface as a typed BzlError::Unsupported"
+            matches!(
+                e.evaluate(&EvalEnv::default(), "m", "x = range(3)\n", &[]),
+                Err(BzlError::Unsupported { .. })
+            ),
+            "an unrepresentable value (a module-scope range) must surface as a typed BzlError::Unsupported"
         );
     }
 
@@ -443,14 +461,15 @@ my_rule = rule(implementation = _impl, attrs = {\"deps\": attr.label_list()})
         );
     }
 
-    /// A rule's impl declares an action (`declare_action`); it surfaces in `RuleResult.actions` (the analysis
-    /// output the execution phase consumes) alongside the providers.
+    /// A rule's impl declares an action (`ctx.actions.run`); it surfaces in `RuleResult.actions` (the analysis
+    /// output the execution phase consumes) alongside the providers. Projection law: `argv = [executable] +
+    /// flattened arguments`, outputs as declared.
     pub fn supports_action_declaration<E: BzlEvaluator>(e: &E) {
         let src = "\
 NumberInfo = provider(\"NumberInfo\", fields = [\"x\"])
 
 def _impl(ctx):
-    declare_action(mnemonic = \"Touch\", argv = [\"touch\", \"out\"], outputs = [\"out\"])
+    ctx.actions.run(mnemonic = \"Touch\", executable = \"touch\", arguments = [\"out\"], outputs = [\"out\"])
     return [NumberInfo(x = 1)]
 
 my_rule = rule(implementation = _impl, attrs = {})

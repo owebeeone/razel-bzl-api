@@ -24,3 +24,15 @@ mutant_builtins_digest_folded_for_bzlmod = []
 # RED-FIRST (phase-env lockdown, key fact C): builtins injection silently ADDS a non-registered name
 # instead of failing closed → builtins_injection_override_only must go red.
 mutant_injection_adds_new_name = []
+# RED-FIRST (T20 R-load-codec, tag 9): emit struct fields in DECLARATION order instead of name-sorted →
+# two structs equal-but-for-kwargs-order digest differently (digest instability) → the canonical-order
+# gate (struct_fields_canonical_sorted) must go red.
+mutant_struct_fields_unsorted = []
+# RED-FIRST (T20 R-load-codec, tag 10): collapse a FunctionRef to NAME-ONLY (drop module + defining_digest)
+# → two same-named functions from different modules alias, and a body change stops re-fingerprinting →
+# the function-identity gate (function_ref_carries_module_identity) must go red.
+mutant_function_ref_drops_module = []
+# RED-FIRST (T20 select, tag 15): emit a select's condition dict in DECLARATION order instead of
+# label-sorted → two selects equal-but-for-condition-order digest differently (digest instability) →
+# the canonical-order gate (select_frame_canonical_and_injective) must go red.
+mutant_select_conditions_unsorted = []

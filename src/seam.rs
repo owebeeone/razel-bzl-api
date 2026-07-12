@@ -1,7 +1,19 @@
 use crate::{
-    BzlModule, BzlValue, DepProviders, Dialect, EvalEnv, LoadKind, PredeclaredEnvId,
+    BzlModule, BzlValue, DepProviders, Dialect, EvalEnv, LoadKind, ModuleFileValue, PredeclaredEnvId,
     ResolvedToolchain, RuleResult, TargetDecl,
 };
+
+/// A BUILD-file `glob()` call's arguments, extracted at eval time (the two-pass Globber pre-scan). All
+/// patterns are PACKAGE-relative. `exclude_directories` (Bazel default 1 → true) filters directory matches;
+/// `allow_empty` (Bazel 7+ default false — `--incompatible_disallow_empty_glob`) makes an empty result a
+/// typed error. Equality is by ALL fields so the resolver keys a resolved file list back to its exact call.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GlobSpec {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub exclude_directories: bool,
+    pub allow_empty: bool,
+}
 
 /// Fail-closed evaluation errors — never a panic, never a silent default.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -64,6 +76,21 @@ pub trait BzlEvaluator: Send + Sync {
         loaded: &[(String, BzlModule)],
     ) -> Result<Vec<TargetDecl>, BzlError>;
 
+    /// GLOB-AWARE BUILD evaluation (T20 TF-unblocker A) — the two-pass Globber shape a restart engine needs.
+    /// `resolved = None` is the COLLECT pass: every `glob()` records its [`GlobSpec`] (returned as the second
+    /// tuple element) and yields the EMPTY list, so eval completes and the caller learns which globs to
+    /// resolve against the filesystem graph. `resolved = Some(map)` is the RESOLVED pass: each `glob()` returns
+    /// the pre-resolved sorted, package-relative file list for its matching spec (fail-closed if a spec was
+    /// never collected). The plain [`BzlEvaluator::evaluate_build`] keeps a glob-less contract (a `glob()` there
+    /// is a typed error) so its many callers are untouched; the PACKAGE node uses THIS entry point.
+    fn evaluate_build_globs(
+        &self,
+        package_name: &str,
+        source: &str,
+        loaded: &[(String, BzlModule)],
+        resolved: Option<&[(GlobSpec, Vec<String>)]>,
+    ) -> Result<(Vec<TargetDecl>, Vec<GlobSpec>), BzlError>;
+
     /// Run a rule's implementation and return the providers it publishes — the analysis-phase seam. The rule
     /// is defined in `rule_source` (the evaluator re-evaluates it to obtain the live impl + provider/ctx
     /// machinery); `rule_name` selects which rule. `loaded` supplies the rule `.bzl`'s own `load()` deps;
@@ -92,5 +119,13 @@ pub trait BzlEvaluator: Send + Sync {
         deps: &[DepProviders],
         toolchains: &[ResolvedToolchain],
     ) -> Result<RuleResult, BzlError>;
+
+    /// Evaluate the workspace MODULE.bazel (D6, C6) in a fail-closed MODULE-dialect env exposing ONLY
+    /// `module()`, `register_toolchains()`, `use_repo_rule()` (the reserved Bzlmod evaluation) — an unknown
+    /// name is a typed error. Yields the module name, the registered-toolchain labels, and the
+    /// `new_local_repository` external-source-root declarations. This is razel's single declaration-surface
+    /// read: the composition root builds its `ExternalRepos` + registered-toolchain set FROM this, so razel
+    /// and Bazel learn the workspace from the same file.
+    fn evaluate_module_file(&self, source: &str) -> Result<ModuleFileValue, BzlError>;
 }
 

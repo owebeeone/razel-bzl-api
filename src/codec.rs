@@ -1,8 +1,123 @@
-use crate::{BzlValue, Depset, ProviderId, ProviderInstance};
+use crate::{AttrDecl, BzlValue, Depset, FunctionRef, ProviderId, ProviderInstance, SelectArm};
 
 fn framed(b: &mut Vec<u8>, s: &[u8]) {
     b.extend_from_slice(&(s.len() as u64).to_be_bytes());
     b.extend_from_slice(s);
+}
+
+/// Encode an optional string as `[0x00]` (None) or `[0x01][u64-framed bytes]`.
+fn framed_opt(b: &mut Vec<u8>, s: &Option<String>) {
+    match s {
+        None => b.push(0),
+        Some(v) => {
+            b.push(1);
+            framed(b, v.as_bytes());
+        }
+    }
+}
+
+/// Encode a list of strings as `[u64 count]` then each `[u64-framed bytes]`.
+fn framed_list(b: &mut Vec<u8>, items: &[String]) {
+    b.extend_from_slice(&(items.len() as u64).to_be_bytes());
+    for s in items {
+        framed(b, s.as_bytes());
+    }
+}
+
+/// The attr-marker digest frame (T20 R-load-codec, tag 13): `[tag 13][code byte][allow_files: opt-tag + list |
+/// 0x00 absent][providers list][mandatory byte][default: opt-string]`. Private: reachable only through
+/// [`encode_bzl_value`].
+fn encode_attr_decl(a: &AttrDecl, b: &mut Vec<u8>) {
+    b.push(13);
+    b.push(a.code);
+    match &a.allow_files {
+        None => b.push(0),
+        Some(exts) => {
+            b.push(1);
+            framed_list(b, exts);
+        }
+    }
+    framed_list(b, &a.providers);
+    b.push(a.mandatory as u8);
+    framed_opt(b, &a.default);
+}
+
+/// The select digest frame (T20 select, tag 15 — canonical, recursive): `[tag 15][u64 arm count]` then per
+/// arm a discriminant byte + payload. `Concrete` → `[0x00][encoded value]`; `Branch` →
+/// `[0x01][u64 cond count]` then per condition IN CANONICAL LABEL-SORTED ORDER `[u64-framed label][encoded
+/// value]`, then `[u64-framed no_match_error]`. Sorting the conditions is what makes the digest independent of
+/// the `select({...})` dict declaration order (a select dict is order-independent for matching, unlike a
+/// runtime `dict` whose tag-12 frame preserves insertion order). Private: reachable only through
+/// [`encode_bzl_value`].
+fn encode_select(arms: &[SelectArm], b: &mut Vec<u8>) {
+    b.push(15);
+    b.extend_from_slice(&(arms.len() as u64).to_be_bytes());
+    for arm in arms {
+        match arm {
+            SelectArm::Concrete(v) => {
+                b.push(0x00);
+                encode_bzl_value(v, b);
+            }
+            SelectArm::Branch { conditions, no_match_error } => {
+                b.push(0x01);
+                b.extend_from_slice(&(conditions.len() as u64).to_be_bytes());
+                // Canonical: emit conditions in LABEL-SORTED order. `convert` already sorts, but the codec
+                // re-sorts defensively so the ONE digest funnel cannot emit a declaration-ordered (unstable)
+                // frame — the same belt-and-braces the tag-9 struct frame uses.
+                let mut idx: Vec<usize> = (0..conditions.len()).collect();
+                if !cfg!(feature = "mutant_select_conditions_unsorted") {
+                    idx.sort_by(|&i, &j| conditions[i].0.cmp(&conditions[j].0));
+                }
+                for &i in &idx {
+                    let (label, value) = &conditions[i];
+                    framed(b, label.as_bytes());
+                    encode_bzl_value(value, b);
+                }
+                framed(b, no_match_error.as_bytes());
+            }
+        }
+    }
+}
+
+/// The struct digest frame (T20 R-load-codec, tag 9 — canonical, recursive): `[tag 9][u64 field count]` then,
+/// per field in NAME-SORTED order, `[u64-framed name][encoded value]`. Sorting is what makes the digest
+/// independent of `struct()` kwargs order (two structs with the same fields in different declaration orders
+/// digest identically). Private: reachable only through [`encode_bzl_value`].
+fn encode_struct(fields: &[(String, BzlValue)], b: &mut Vec<u8>) {
+    b.push(9);
+    b.extend_from_slice(&(fields.len() as u64).to_be_bytes());
+    // Canonical: emit in NAME-SORTED order. The evaluator already sorts on convert, but the codec re-sorts
+    // defensively so the ONE digest funnel cannot emit a declaration-ordered (unstable) frame.
+    let mut idx: Vec<usize> = (0..fields.len()).collect();
+    if cfg!(feature = "mutant_struct_fields_unsorted") {
+        // MUTANT: emit fields in DECLARATION order → two structs equal-but-for-order digest differently
+        // (digest instability); the canonical-order round-trip/equality gate goes red.
+    } else {
+        idx.sort_by(|&i, &j| fields[i].0.cmp(&fields[j].0));
+    }
+    for &i in &idx {
+        let (name, value) = &fields[i];
+        framed(b, name.as_bytes());
+        encode_bzl_value(value, b);
+    }
+}
+
+/// The function-reference digest frame (T20 R-load-codec, tag 10): `[tag 10][u64-framed module][u64-framed
+/// name][32-byte defining_digest]`. Identity is the PAIR `(module, name)` plus the module content digest;
+/// NO closure/body is ever encoded (Bazel never serializes Starlark functions — the digest basis is the
+/// transitive module source, carried by `defining_digest`). Private: reachable only through [`encode_bzl_value`].
+fn encode_function_ref(f: &FunctionRef, b: &mut Vec<u8>) {
+    b.push(10);
+    if cfg!(feature = "mutant_function_ref_drops_module") {
+        // MUTANT: collapse the ref to NAME-ONLY (drop the module + defining_digest) → two same-named functions
+        // from DIFFERENT modules alias, and a body change no longer re-fingerprints. The function-identity gate
+        // goes red on a same-name/different-module pair.
+        framed(b, f.name.as_bytes());
+        return;
+    }
+    framed(b, f.module.as_bytes());
+    framed(b, f.name.as_bytes());
+    b.extend_from_slice(&f.defining_digest);
 }
 
 /// The provider IDENTITY frame — THE one digest rendering of a `ProviderId`, shared by
@@ -102,6 +217,45 @@ pub fn encode_bzl_value(v: &BzlValue, b: &mut Vec<u8>) {
             }
         }
         BzlValue::Depset(d) => encode_depset(d, b),
+        // File (T17-C5): the next FREE tag after depset's 7. A minimal documented frame — its exec-path
+        // string, u64-length-framed. That path is the SAME string the frozen ActionTemplate/dep_outputs
+        // chaining map keys on, so a File surfaced to `.bzl` and a File carried in a provider round-trip to
+        // the byte-identical exec path (the `dep[RustInfo].rlib.path` consuming side is lossless).
+        BzlValue::File(p) => {
+            b.push(8);
+            framed(b, p.as_bytes());
+        }
+        // Struct (T20 R-load-codec): tag 9, canonical name-sorted recursive frame.
+        BzlValue::Struct(fields) => encode_struct(fields, b),
+        // FunctionRef (T20 R-load-codec): tag 10, (module, name, defining_digest) — never the body.
+        BzlValue::FunctionRef(f) => encode_function_ref(f, b),
+        // Label (T20 R-load-codec): tag 11, its canonical label string (u64-framed).
+        BzlValue::Label(s) => {
+            b.push(11);
+            framed(b, s.as_bytes());
+        }
+        // Dict (T20 R-load-codec): tag 12, `[u64 pair count]` then per pair `[key][value]` in INSERTION
+        // order (Starlark dict iteration order is observable → order is digest content, never sorted).
+        BzlValue::Dict(pairs) => {
+            b.push(12);
+            b.extend_from_slice(&(pairs.len() as u64).to_be_bytes());
+            for (k, v) in pairs {
+                encode_bzl_value(k, b);
+                encode_bzl_value(v, b);
+            }
+        }
+        // AttrDecl (T20 R-load-codec): tag 13, the attr.* schema marker.
+        BzlValue::AttrDecl(a) => encode_attr_decl(a, b),
+        // Tuple (T20 R-load-codec): tag 14, `[u64 count]` then each element (a distinct tag from list's 4).
+        BzlValue::Tuple(items) => {
+            b.push(14);
+            b.extend_from_slice(&(items.len() as u64).to_be_bytes());
+            for it in items {
+                encode_bzl_value(it, b);
+            }
+        }
+        // Select (T20 select): tag 15, the canonical arm/branch frame (conditions label-sorted).
+        BzlValue::Select(arms) => encode_select(arms, b),
     }
 }
 

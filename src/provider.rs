@@ -173,3 +173,30 @@ pub struct RuleResult {
     pub actions: Vec<ActionTemplate>,
 }
 
+/// One `new_local_repository(...)` declaration from MODULE.bazel (D6, C6): an external source root. `name` is
+/// the apparent repo name (`@taut-shape//…`), `path` its root relative to the workspace root. `build_file` is
+/// OPTIONAL (T20 R1): `Some(label)` overlays a BUILD-less repo with a main-repo `//pkg:BUILD.bazel` (taut-shape);
+/// `None` mounts a repo that ships its OWN BUILD/.bzl files, read AS-IS (a real Bazel module, e.g. rules_rust).
+/// The composition root maps these into the `ExternalRepos` registry (resolving `path` against the workspace
+/// root, and the `build_file` label — when present — to a main-root-relative path).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RepoDecl {
+    pub name: String,
+    pub path: String,
+    pub build_file: Option<String>,
+}
+
+/// The evaluated MODULE.bazel (D6, C6): the workspace's declaration surface both razel and real Bazel read.
+/// Yielded by [`crate::BzlEvaluator::evaluate_module_file`], evaluated in a fail-closed module-dialect env
+/// exposing ONLY `module()`, `register_toolchains()`, `use_repo_rule()` — an unknown name is a typed error.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ModuleFileValue {
+    /// `module(name = …)`.
+    pub module_name: String,
+    /// The labels of `register_toolchains(…)` — the toolchains resolution may select from (each a
+    /// `//pkg:name` label of a `toolchain()` target).
+    pub registered_toolchains: Vec<String>,
+    /// The `new_local_repository(…)` external-source-root declarations.
+    pub repos: Vec<RepoDecl>,
+}
+

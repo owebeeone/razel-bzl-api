@@ -1,0 +1,20 @@
+# razel-bzl-api/BUILD.bazel — razel building its OWN Starlark value/codec/provider API seam (part of
+# razel-daemon's fat closure). NO deps (a pure data-model seam; the starlark engine binding lives in
+# razel-bzl-starlark). Multi-file; the `*_tests`/`conformance_mod` files are #[cfg(test)] — staged with the
+# crate but not compiled into the rlib (the non-test build ignores them).
+load("//rules/rust:rust.bzl", "rust_library")
+
+rust_library(
+    name = "razel_bzl_api",
+    srcs = [
+        "src/lib.rs",  # crate root (listed first)
+        "src/canonical_codec_tests.rs",
+        "src/codec.rs",
+        "src/conformance_mod.rs",
+        "src/env.rs",
+        "src/provider.rs",
+        "src/seam.rs",
+        "src/values.rs",
+    ],
+    visibility = ["//visibility:public"],  # consumed cross-package (bzl-starlark, load, package, analysis, action, toolchain, host)
+)
